@@ -2,7 +2,7 @@
 We provide a web interface for visualizing `.traj` files from the `trajectories` folder more easily.
 
 **Set Up**
-* Run `python server.py trajectories`
+* Run `python inspector/server.py trajectories`
 * Open http://localhost:8000 in your browser to use the inspector.
 
 **Additional flags**

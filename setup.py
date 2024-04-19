@@ -44,6 +44,7 @@ setuptools.setup(
         'together',
         'unidiff',
         'rich-argparse',
+        'google-cloud-aiplatform'
     ],
     include_package_data=True,
 )

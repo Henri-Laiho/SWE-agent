@@ -20,3 +20,9 @@ dependencies:
     - together
     - ollama
     - rich-argparse
+    - google-cloud-aiplatform
+    - networkx==3.2.1
+    - diskcache==5.6.3
+    - grep-ast==0.2.4
+    - prompt-toolkit==3.0.43
+    - scipy==1.11.4
