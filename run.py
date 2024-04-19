@@ -4,11 +4,16 @@ import os
 import re
 import subprocess
 import traceback
+from collections import namedtuple
 from typing import Any, Dict, Optional
 import rich.console
 import rich.markdown
 import rich.panel
 import rich.markdown
+
+from aiderrepomap.swe_repomap import RepoMap
+Tag = namedtuple("Tag", "rel_fname fname line name kind".split())
+
 try:
     from rich_argparse import RichHelpFormatter
 except ImportError:
@@ -133,6 +138,13 @@ def main(args: ScriptArguments):
 
             # Get info, patch information
             issue = getattr(env, "query", None)
+
+            if args.environment.repo_path:
+                rm = RepoMap(root=args.environment.repo_path)
+                repo_map = rm.get_repo_map()
+            else:
+                repo_map = "n/a"
+
             files = []
             assert env.record is not None  # mypy
             if "patch" in env.record:
@@ -154,7 +166,8 @@ def main(args: ScriptArguments):
                 "issue": issue,
                 "files": files,
                 "test_files": test_files,
-                "tests": tests
+                "tests": tests,
+                "repo_map": repo_map
             }
             info, trajectory = agent.run(
                 setup_args=setup_args,
