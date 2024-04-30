@@ -11,6 +11,8 @@ import rich.markdown
 import rich.panel
 import rich.markdown
 
+from sweagent.agent.agents import SWESwarm
+
 Tag = namedtuple("Tag", "rel_fname fname line name kind".split())
 
 try:
@@ -30,7 +32,6 @@ from simple_parsing import parse
 from simple_parsing.helpers.serialization.serializable import FrozenSerializable
 from simple_parsing.helpers.flatten import FlattenedAccess
 from sweagent import (
-    Agent,
     AgentArguments,
     EnvironmentArguments,
     ModelArguments,
@@ -38,7 +39,6 @@ from sweagent import (
     get_data_path_name,
 )
 from swebench import KEY_INSTANCE_ID, KEY_MODEL, KEY_PREDICTION
-from unidiff import PatchSet
 
 from sweagent.environment.utils import InvalidGithubURL, get_associated_commit_urls, get_gh_issue_data, parse_gh_issue_url
 
@@ -83,7 +83,7 @@ class ActionsArguments(FlattenedAccess, FrozenSerializable):
 class ScriptArguments(FlattenedAccess, FrozenSerializable):
     """Configure the control flow of the run.py script"""
     environment: EnvironmentArguments
-    agent: AgentArguments
+    engineer_agent: AgentArguments
     actions: ActionsArguments
     instance_filter: str = ".*"  # Only run instances that completely match this regex
     skip_existing: bool = True  # Skip instances with existing trajectories
@@ -91,17 +91,16 @@ class ScriptArguments(FlattenedAccess, FrozenSerializable):
     # Raise unhandled exceptions during the run (useful for debugging)
     raise_exceptions: bool = False
 
-    @property
     def run_name(self):
         """Generate a unique name for this run based on the arguments."""
-        model_name = self.agent.model.model_name.replace(":", "-")
+        model_name = self.engineer_agent.model.model_name.replace(":", "-")
         data_stem = get_data_path_name(self.environment.data_path)
-        config_stem = Path(self.agent.config_file).stem
+        config_stem = Path(self.engineer_agent.config_file).stem
 
-        temp = self.agent.model.temperature
-        top_p = self.agent.model.top_p
+        temp = self.engineer_agent.model.temperature
+        top_p = self.engineer_agent.model.top_p
 
-        per_instance_cost_limit = self.agent.model.per_instance_cost_limit
+        per_instance_cost_limit = self.engineer_agent.model.per_instance_cost_limit
         install_env = self.environment.install_environment
 
         return (
@@ -113,11 +112,12 @@ class ScriptArguments(FlattenedAccess, FrozenSerializable):
 
 def main(args: ScriptArguments):
     logger.info(f"📙 Arguments: {args.dumps_yaml()}")
-    agent = Agent("primary", args.agent)
+    swarm = SWESwarm(args)
+    SWESwarm.the_swarm = swarm
 
     env = SWEEnv(args.environment)
 
-    traj_dir = Path("trajectories") / Path(getuser()) / args.run_name
+    traj_dir = Path("trajectories") / Path(getuser()) / args.run_name()
     traj_dir.mkdir(parents=True, exist_ok=True)
 
     save_arguments(traj_dir, args)
@@ -140,40 +140,26 @@ def main(args: ScriptArguments):
 
             files = []
             assert env.record is not None  # mypy
-            if "patch" in env.record:
-                files = "\n".join(
-                    [f"- {x.path}" for x in PatchSet(env.record["patch"]).modified_files]
-                )
-            # Get test files, F2P tests information
-            test_files = []
-            if "test_patch" in env.record:
-                test_patch_obj = PatchSet(env.record["test_patch"])
-                test_files = "\n".join(
-                    [f"- {x.path}" for x in test_patch_obj.modified_files + test_patch_obj.added_files]
-                )
-            tests = ""
-            if "FAIL_TO_PASS" in env.record:
-                tests = "\n".join([f"- {x}" for x in env.record["FAIL_TO_PASS"]])
 
             setup_args = {
                 "issue": issue,
                 "files": files,
-                "test_files": test_files,
-                "tests": tests
+                "test_files": [],
+                "tests": []
             }
-            info, trajectory = agent.run(
+            swarm.run(
                 setup_args=setup_args,
                 env=env,
                 observation=observation,
                 traj_dir=traj_dir,
                 return_type="info_trajectory",
+                actions=args.actions,
+                instance_id=instance_id,
             )
+            logger.info('SWE-Swarm task completed successfully')
             save_predictions(traj_dir, instance_id, info)
-            patch_path = save_patch(traj_dir, instance_id, info)
             if args.actions.open_pr and should_open_pr(args, info, token=env._github_token):
                 env.open_pr(trajectory=trajectory)
-            if args.actions.apply_patch_locally and patch_path is not None and env.record["repo_type"] == "local":
-                apply_patch(Path(args.environment.repo_path), patch_file=patch_path)
 
         except KeyboardInterrupt:
             logger.info("Exiting InterCode environment...")
@@ -359,11 +345,11 @@ def get_args(args=None) -> ScriptArguments:
             install_environment=True,
         ),
         skip_existing=True,
-        agent=AgentArguments(
+        engineer_agent=AgentArguments(
             model=ModelArguments(
                 model_name="gpt4",
-                total_cost_limit=0.0,
-                per_instance_cost_limit=3.0,
+                total_cost_limit=2000.0,
+                per_instance_cost_limit=1000.0,
                 temperature=0.0,
                 top_p=0.95,
             ),

@@ -25,7 +25,7 @@ from git import InvalidGitRepositoryError, Repo
 
 LOGGER_NAME = "intercode"
 START_UP_DELAY = 5
-TIMEOUT_DURATION = 25
+TIMEOUT_DURATION = 120
 GITHUB_ISSUE_URL_PATTERN = re.compile(r'github\.com\/(.*?)\/(.*?)\/issues\/(\d+)')
 GITHUB_REPO_URL_PATTERN = re.compile(r'.*[/@]?github\.com\/([^/]+)\/([^/]+)')
 

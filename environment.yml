@@ -21,6 +21,8 @@ dependencies:
     - ollama
     - rich-argparse
     - google-cloud-aiplatform
+    - langchain
+    - langchain-google-vertexai
     - networkx==3.2.1
     - diskcache==5.6.3
     - grep-ast==0.2.4

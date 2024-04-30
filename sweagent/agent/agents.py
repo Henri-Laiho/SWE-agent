@@ -1,12 +1,28 @@
 import json
+import os
 import re
 import logging
+import subprocess
 
 from dataclasses import dataclass
 from pathlib import Path
+from time import sleep
+
+import vertexai
+from google.api_core.exceptions import ResourceExhausted, InternalServerError
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable, RunnableConfig
+from langchain_core.runnables.utils import Output, Input
+from langchain_core.tools import tool
+from langchain_google_vertexai import ChatVertexAI
+from openai import RateLimitError
 from simple_parsing.helpers.fields import field
 from simple_parsing.helpers.serialization.serializable import FrozenSerializable
 from simple_parsing.helpers.flatten import FlattenedAccess
+from swebench import KEY_MODEL, KEY_INSTANCE_ID, KEY_PREDICTION
+
+from aiderrepomap.dump import dump
+from aiderrepomap.swe_repomap import RepoMap
 from sweagent.agent.commands import Command, ParseCommand
 from sweagent.agent.history_processors import HistoryProcessor
 from sweagent.agent.models import (
@@ -223,7 +239,6 @@ class Agent:
         self.history = []
         self.last_container_id = None
 
-
     def setup(self, instance_args, init_model_stats=None) -> None:
         """Setup the agent for a new instance."""
         assert self.config is not None  # mypy
@@ -238,12 +253,12 @@ class Agent:
         ]
 
         if len(self.config.demonstrations) > 0 and "history_to_messages" in dir(
-            self.model
+                self.model
         ):
             for demonstration_path in self.config.demonstrations:
                 if (
-                    self.config.demonstration_template is None
-                    and not self.config.put_demos_in_history
+                        self.config.demonstration_template is None
+                        and not self.config.put_demos_in_history
                 ):
                     raise ValueError(
                         "Cannot use demonstrations without a demonstration template or put_demos_in_history=True"
@@ -256,7 +271,7 @@ class Agent:
                     entry
                     for entry in demo_history
                     if ("agent" not in entry)
-                    or ("agent" in entry and entry["agent"] == self.name)
+                       or ("agent" in entry and entry["agent"] == "primary")
                 ]
 
                 if self.config.put_demos_in_history:
@@ -321,7 +336,7 @@ class Agent:
                 k: v
                 for k, v in self.command_patterns.items()
                 if k in self.config.multi_line_command_endings
-                or k == self.config.submit_command
+                   or k == self.config.submit_command
             }
             patterns += {
                 k: v
@@ -358,14 +373,14 @@ class Agent:
             first_match = self._get_first_match(rem_action, "multi_line_no_subroutines")
             if first_match:
                 pre_action = rem_action[: first_match.start()]
-                match_action = rem_action[first_match.start() : first_match.end()]
-                rem_action = rem_action[first_match.end() :]
+                match_action = rem_action[first_match.start(): first_match.end()]
+                rem_action = rem_action[first_match.end():]
                 if pre_action.strip():
                     parsed_action.append(pre_action)
                 if match_action.strip():
                     eof = first_match.group(3).strip()
                     if not match_action.split("\n")[0].strip().endswith(f"<< '{eof}'"):
-                        guarded_command = match_action[first_match.start() :]
+                        guarded_command = match_action[first_match.start():]
                         first_line = guarded_command.split("\n")[0]
                         guarded_command = guarded_command.replace(
                             first_line, first_line + f" << '{eof}'", 1
@@ -386,8 +401,8 @@ class Agent:
             first_match = self._get_first_match(rem_action, pattern_type)
             if first_match:
                 pre_action = rem_action[: first_match.start()]
-                match_action = rem_action[first_match.start() : first_match.end()]
-                rem_action = rem_action[first_match.end() :]
+                match_action = rem_action[first_match.start(): first_match.end()]
+                rem_action = rem_action[first_match.end():]
                 if pre_action.strip():
                     parsed_action.append(
                         {"agent": self.name, "action": pre_action, "cmd_name": None}
@@ -453,10 +468,72 @@ class Agent:
         self.subroutine_patterns[self.config.submit_command] = submit_pat
         self.command_patterns[self.config.submit_command] = submit_pat
 
+    def read_history(self):
+        history_content = ''
+        for h in self.history:
+            role = h['role']
+            if role == 'assistant':
+                role = self.name
+                action = h['action']
+                thought = h['thought']
+                history_content += f'{role} thinks: {thought}\n\n{role} action: {action}\n\n'
+                continue
+            elif role == 'user':
+                role = 'Computer response'
+            content = h['content']
+            history_content += f'{role}: {content}\n\n'
+        return history_content
+
+    def guard_against_repeating_action_loop(self, thought, action, output, state_vars):
+        solutions = {
+            'edit': ' I should edit or rewrite a bigger section of the code at once',
+            'goto': ' I just used goto command to this line, I should now execute some other command'
+        }
+        error_feedbacks = [
+            'Your proposed edit has introduced new syntax error(s). Please understand the fixes and retry your edit commmand.',
+            'Error:',
+        ]
+
+        open_file = state_vars['open_file']
+        failed = False
+        last_goto_line = None
+        for i in range(1, min(10, len(self.history))):
+            if self.name == self.history[-i]['agent']:
+                if 'user' == self.history[-i]['role']:
+                    if any(self.history[-i]['content'].startswith(it) for it in error_feedbacks):
+                        failed = True
+                elif 'assistant' == self.history[-i]['role']:
+                    if action == self.history[-i]['action']:
+                        if failed and (action != 'edit' or self.history[-i]['open_file'] == open_file):
+                            act = action.split()[0]
+                            solution = solutions[act] if act in solutions else ''
+                            command_outcome = ' that previously failed' if failed else ''
+                            return f"I am again trying to execute the command {act}{command_outcome}. I should try a different approach.{solution}", 'pwd && ls -la', output
+                        if action.startswith('goto'):
+                            try:
+                                line = int(action.split()[-1])
+                                if last_goto_line is not None and abs(last_goto_line - line) < 60:
+                                    return f"When scanning a file I should use the cat command to read the whole file at a time.", 'pwd && ls -la', output
+                            except ValueError:
+                                line = None
+                            last_goto_line = line
+                    else:
+                        last_goto_line = None
+                    failed = False
+                else:
+                    failed = False
+                    last_goto_line = None
+        return thought, action, output
+
     def forward(
-        self, observation: str, available_actions: list[str], state: str
+            self, observation: str, available_actions: list[str], state: str, max_steps_reached: bool = False
     ) -> Tuple[str, str, str]:
-        thought, action, output = self.forward_with_error_check(observation, state)
+        state_vars = json.loads(state)
+        if max_steps_reached:
+            thought, action, output = 'Pause due to max steps executed', 'exit_steps', 'Pause due to max steps executed'
+        else:
+            thought, action, output = self.forward_with_error_check(observation, state_vars)
+            thought, action, output = self.guard_against_repeating_action_loop(thought, action, output, state_vars)
 
         self.history.append(
             {
@@ -465,6 +542,7 @@ class Agent:
                 "thought": thought,
                 "action": action,
                 "agent": self.name,
+                "open_file": state_vars['open_file']
             }
         )
 
@@ -473,18 +551,16 @@ class Agent:
 
         return thought, action, output
 
-    def forward_model(self, observation: str, state: str) -> str:
+    def forward_model(self, observation: str, state_vars: dict) -> str:
         """Query the model with the current state and observation with the appropriate template.
 
         Returns the model output."""
         assert self.config is not None  # mypy
 
-        state_vars = json.loads(state)
-
         templates: List[str] = []
         # Determine observation template based on what prior observation was
         if self.history[-1]["role"] == "system" or self.history[-1].get(
-            "is_demo", False
+                "is_demo", False
         ):
             # Show instance template if prev. obs. was initial system message
             templates = [self.config.instance_template]
@@ -556,8 +632,8 @@ class Agent:
         return False
 
     def check_format_and_requery(
-        self,
-        output: str,
+            self,
+            output: str,
     ) -> Tuple[str, str, str]:
         """Query the model with the current state and observation with the appropriate template.
 
@@ -600,7 +676,7 @@ class Agent:
         return "Exit due to format error", "exit_format", output
 
     def forward_with_error_check(
-        self, observation: str, state: str
+            self, observation: str, state: str
     ) -> Tuple[str, str, str]:
         """Wrapper around `self.forward_model` that handles errors and retries
         due to format errors or blocked actions. 
@@ -637,11 +713,11 @@ class Agent:
     def set_environment_vars(self, env, env_variables):
         assert self.config is not None  # mypy
         commands_to_execute = (
-            [self.config.state_command.code]
-            +
-            # [code for code in self.config.util_functions] +
-            # [command.code for command in self.config._commands] +
-            [f"{k}={v}" for k, v in env_variables.items()]
+                [self.config.state_command.code]
+                +
+                # [code for code in self.config.util_functions] +
+                # [command.code for command in self.config._commands] +
+                [f"{k}={v}" for k, v in env_variables.items()]
         )
         commands = "\n".join(commands_to_execute)
         try:
@@ -721,20 +797,11 @@ class Agent:
         self.model.stats.replace(sub_agent.model.stats)
         return sub_agent_output
 
-    def run(
-        self,
-        setup_args: Dict[str, Any],
-        env: SWEEnv,
-        observation: Optional[str] = None,
-        traj_dir: Optional[Path] = None,
-        return_type: Optional[str] = "info",
-        init_model_stats: Optional[APIStats] = None,
-    ):
-        """
-        Run the agent on an environment.
-        Return the final value of the specified return type.
-        """
-        done = False
+    def mc_setup(self,
+                 setup_args: Dict[str, Any],
+                 env: SWEEnv,
+                 init_model_stats: Optional[APIStats] = None,
+                 ):
         assert env.container_obj is not None
         assert self.config is not None  # mypy
 
@@ -747,22 +814,56 @@ class Agent:
         # Re-initialize primary
         self.setup(setup_args, init_model_stats)
 
-        # Run action/observation loop
-        trajectory = []
-        info = {}
+        # Init action/observation loop
+        self.mc_trajectory = []
+        self.mc_info = {}
+
+    def receive_message(self, sender: str, msg: str):
+        self.history.append({'role': 'user', 'content': f'{sender} said: {msg}', 'agent': self.name})
+
+    def run_continue(self,
+                     env: SWEEnv,
+                     observation: Optional[str] = None,
+                     traj_dir: Optional[Path] = None,
+                     return_type: Optional[str] = "info",
+                     max_steps: Optional[int] = None,
+                     ):
+        assert env.container_obj is not None
+        assert self.config is not None  # mypy
+
+        if env.container_obj.id != self.last_container_id:
+            logger.info(
+                f"Initializing agent settings for container {env.container_obj.id}"
+            )
+            self.init_environment_vars(env)
+            self.last_container_id = env.container_obj.id
+
+        trajectory = self.mc_trajectory
+        done = False
+        step = 0
+
         while not done:
+            if env.repo_path:
+                rm = RepoMap(root=env.repo_path)
+                repo_map = rm.get_repo_map()
+            else:
+                repo_map = "n/a"
+            self.system_args["repo_map"] = repo_map
+
             state = env.communicate(self.state_command) if self.state_command else None
+
             thought, action, output = self.forward(
-                observation, env.get_available_actions(), state
+                observation, env.get_available_actions(), state, max_steps and max_steps <= step
             )
             observations = list()
             run_action = self._guard_multiline_input(action)
             for sub_action in self.split_actions(run_action):
                 if (
-                    sub_action["agent"] == self.name
-                    or sub_action["cmd_name"] == self.config.submit_command
+                        sub_action["agent"] == self.name
+                        or sub_action["cmd_name"] == self.config.submit_command
                 ):
                     obs, _, done, info = env.step(sub_action["action"])
+                    self.mc_info = info
                     observations.append(obs)
                     if sub_action["cmd_name"] == self.config.submit_command:
                         done = True
@@ -784,11 +885,342 @@ class Agent:
                     "thought": thought,
                 }
             )
-            info["model_stats"] = self.model.stats.to_dict()
+            self.mc_info["model_stats"] = self.model.stats.to_dict()
             if traj_dir:
-                self.save_trajectory(trajectory, traj_dir, env, info)
+                self.save_trajectory(trajectory, traj_dir, env, self.mc_info)
+            step += 1
         if return_type == "info":
-            return info
+            return self.mc_info
         if return_type == "info_trajectory":
-            return info, trajectory
+            return self.mc_info, trajectory
         return trajectory[-1][return_type]
+
+    def run(
+            self,
+            setup_args: Dict[str, Any],
+            env: SWEEnv,
+            observation: Optional[str] = None,
+            traj_dir: Optional[Path] = None,
+            return_type: Optional[str] = "info",
+            init_model_stats: Optional[APIStats] = None,
+    ):
+        """
+        Run the agent on an environment.
+        Return the final value of the specified return type.
+        """
+        done = False
+        assert env.container_obj is not None
+        assert self.config is not None  # mypy
+
+        if env.container_obj.id != self.last_container_id:
+            logger.info(
+                f"Initializing agent settings for container {env.container_obj.id}"
+            )
+            self.init_environment_vars(env)
+            self.last_container_id = env.container_obj.id
+        # Re-initialize primary
+        self.setup(setup_args, init_model_stats)
+
+        # Run action/observation loop
+        trajectory = []
+        self.mc_info = {}
+        self.mc_trajectory = trajectory
+        while not done:
+            if env.repo_path:
+                rm = RepoMap(root=env.repo_path)
+                repo_map = rm.get_repo_map()
+            else:
+                repo_map = "n/a"
+            self.system_args["repo_map"] = repo_map
+
+            state = env.communicate(self.state_command) if self.state_command else None
+            thought, action, output = self.forward(
+                observation, env.get_available_actions(), state
+            )
+            observations = list()
+            run_action = self._guard_multiline_input(action)
+            for sub_action in self.split_actions(run_action):
+                if (
+                        sub_action["agent"] == self.name
+                        or sub_action["cmd_name"] == self.config.submit_command
+                ):
+                    obs, _, done, info = env.step(sub_action["action"])
+                    self.mc_info = info
+                    observations.append(obs)
+                    if sub_action["cmd_name"] == self.config.submit_command:
+                        done = True
+                    if done:
+                        break
+                else:
+                    agent_name = sub_action["agent"]
+                    sub_agent_output = self.call_subroutine(agent_name, sub_action, env)
+                    observations.append(sub_agent_output)
+
+            observation = "\n".join([obs for obs in observations if obs is not None])
+
+            trajectory.append(
+                {
+                    "action": action,
+                    "observation": observation,
+                    "response": output,
+                    "state": state,
+                    "thought": thought,
+                }
+            )
+            self.mc_info["model_stats"] = self.model.stats.to_dict()
+            if traj_dir:
+                self.save_trajectory(trajectory, traj_dir, env, self.mc_info)
+        if return_type == "info":
+            return self.mc_info
+        if return_type == "info_trajectory":
+            return self.mc_info, trajectory
+        return trajectory[-1][return_type]
+
+
+@tool
+def engineer(instructions: str):
+    """Let the engineer continue work on the project with the given instructions.
+    Call when the work presented by the engineer does not meet the requirements of the project or is not
+    tested enough."""
+    finish_tool(STATE_WRITE, instructions)
+
+
+@tool
+def manual_test(details: str, flows_to_test: str):
+    """Instruct the engineer to manually test the software.
+    Call when the work presented by the engineer requires further manual testing to ensure maximum
+    production user satisfaction"""
+    finish_tool(STATE_WRITE,
+                f'The manager has requested you to manually test the software. {details}\n\nHere are the flows that should be tested:\n{flows_to_test}')
+
+
+@tool
+def write_automatic_tests(details: str, test_cases: str):
+    """Request the engineer to write the automated tests."""
+    finish_tool(STATE_WRITE,
+                f'The manager has requested you to write automatic tests:\n{details}\n\nRequired test cases:\n{test_cases}')
+
+
+@tool
+def submit():
+    """Submit the software product to production. Call only when you think the engineer has finished work
+    meeting the requirements presented in the issue AND has sufficiently tested the software via running
+    automated tests or manual testing. This can ONLY be called in case the tests have been implemented, run and PASSED"""
+    finish_tool(STATE_DONE, None)
+
+
+@tool
+def noop():
+    """No operation"""
+    finish_tool(SWESwarm.the_swarm.state, SWESwarm.the_swarm.phase_parameters)
+
+
+STATE_WRITE = 'write'
+STATE_MANAGE = 'manage'
+STATE_DONE = 'done'
+
+
+def finish_tool(_state, _phase_parameters):
+    if SWESwarm.the_swarm is None:
+        raise RuntimeError('State error')
+    SWESwarm.the_swarm.state = _state
+    SWESwarm.the_swarm.phase_parameters = _phase_parameters
+
+
+import config
+
+cfg = config.Config(os.path.join(os.getcwd(), "keys.cfg"))
+vertexai.init(project=cfg.VERTEX_PROJECT, location=cfg.VERTEX_LOCATION)
+
+llm = ChatVertexAI(model="gemini-1.5-pro-preview-0409")
+manager_tools = [engineer, manual_test, write_automatic_tests, submit]
+llm_mgr = llm.bind_tools(manager_tools)
+manager_tools_map = {x.name: x for x in manager_tools}
+
+
+class LCAgent:
+    def __init__(self, llm: Runnable, system: str):
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", system),
+                ("human", "{input}"),
+            ]
+        )
+        self.chain = prompt | llm
+
+    def invoke(
+            self,
+            input: Input,
+            config: Optional[RunnableConfig] = None,
+            **kwargs: Optional[Any],
+    ) -> Output:
+        for i in range(10):
+            try:
+                return self.chain.invoke(input, config, **kwargs)
+            except ResourceExhausted:
+                pass
+            except RateLimitError:
+                pass
+            except InternalServerError:
+                logger.warning('Internal server error occurred in LLM provider, waiting 15 seconds')
+                logger.debug(input)
+                sleep(15)
+                continue
+            time = int(60 * 2 ** i)
+            logger.warning(f'Rate limit exceeded, waiting {time} seconds')
+            sleep(time)
+
+
+import rich.console
+import rich.markdown
+import rich.panel
+import rich.markdown
+
+
+def _print_patch_message(patch_output_file: Path):
+    console = rich.console.Console()
+    msg = [
+        "SWE-agent has produced a patch that it believes will solve the issue you submitted!",
+        "Use the code snippet below to inspect or apply it!"
+    ]
+    panel = rich.panel.Panel.fit(
+        "\n".join(msg),
+        title="🎉 Submission successful 🎉",
+    )
+    console.print(panel)
+    content = [
+        "```bash",
+        f"# The patch has been saved to your local filesystem at:",
+        f"PATCH_FILE_PATH='{patch_output_file.resolve()}'",
+        "# Inspect it:",
+        "cat \"${PATCH_FILE_PATH}\"",
+        "# Apply it to a local repository:",
+        f"cd <your local repo root>",
+        "git apply \"${PATCH_FILE_PATH}\"",
+        "```",
+    ]
+    console.print(rich.markdown.Markdown("\n".join(content)))
+
+
+def save_predictions(traj_dir: Path, instance_id: str, info):
+    output_file = traj_dir / "all_preds.jsonl"
+    model_patch = info["submission"] if "submission" in info else None
+    datum = {
+        KEY_MODEL: Path(traj_dir).name,
+        KEY_INSTANCE_ID: instance_id,
+        KEY_PREDICTION: model_patch,
+    }
+    with open(output_file, "a+") as fp:
+        print(json.dumps(datum), file=fp, flush=True)
+    logger.info(f"Saved predictions to {output_file}")
+
+
+def save_patch(traj_dir: Path, instance_id: str, info) -> Optional[Path]:
+    """Create patch files that can be applied with `git am`.
+
+    Returns:
+        The path to the patch file, if it was saved. Otherwise, returns None.
+    """
+    patch_output_dir = traj_dir / "patches"
+    patch_output_dir.mkdir(exist_ok=True, parents=True)
+    patch_output_file = patch_output_dir / f"{instance_id}.patch"
+    if not info.get("submission"):
+        logger.info("No patch to save.")
+        return
+    model_patch = info["submission"]
+    patch_output_file.write_text(model_patch)
+    _print_patch_message(patch_output_file)
+    return patch_output_file
+
+
+def apply_patch(local_dir: Path, patch_file: Path) -> None:
+    """Apply a patch to a local directory."""
+    assert local_dir.is_dir()
+    assert patch_file.exists()
+    # The resolve() is important, because we're gonna run the cmd
+    # somewhere else
+    cmd = ["git", "apply", "--whitespace=fix", str(patch_file.resolve())]
+    cmd_status = ["git", "status"]
+    cmd_add = ["git", "add", "."]
+    cmd_commit = ["git", "commit", "-m" f'SWE-Agent applied patch {str(patch_file.resolve())}']
+    try:
+        subprocess.run(cmd, cwd=local_dir, check=True)
+        subprocess.run(cmd_status, cwd=local_dir, check=True)
+        subprocess.run(cmd_add, cwd=local_dir, check=True)
+        subprocess.run(cmd_commit, cwd=local_dir, check=True)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to apply patch {patch_file} to {local_dir}: {e}")
+        return
+    logger.info(f"Applied patch {patch_file} to {local_dir}")
+
+
+class SWESwarm:
+    the_swarm = None
+
+    def __init__(self, args):
+        self.args = args
+        self.engineer_agent = Agent("engineer", args.engineer_agent)
+        self.manager_agent = LCAgent(
+            llm_mgr,
+            """You are a manager at a software development team with one engineer. You are responsible for the 
+            quality of the engineer's work and organizing their work. As a response just call one of the functions 
+            provided to indicate how the engineer should proceed or submit if you are certain based on the testing 
+            output that work is done. If the agent exits due to any error, it is time to check on it's progress and 
+            let it resume if on right track or instruct to take a better approach. You never answer to requests from 
+            the engineer, you provide instructions to make the engineer complete the task efficiently. It is important 
+            to avoid the engineer getting stuck and wasting time as their working hours are costly. Remember, the 
+            best way to ensure reliability of the software is by verifying automated test results and coverage and 
+            their match to product requirements (the ISSUE)."""
+        )
+        self.state = STATE_WRITE
+        self.phase_parameters = None
+
+    def run(
+            self,
+            setup_args: Dict[str, Any],
+            env: SWEEnv,
+            observation: Optional[str] = None,
+            traj_dir: Optional[Path] = None,
+            return_type: Optional[str] = "info",
+            init_model_stats: Optional[APIStats] = None,
+            actions: Any = None,
+            instance_id: Optional[str] = None,
+    ):
+        """
+        Run the agent on an environment.
+        Return the final value of the specified return type.
+        """
+
+        self.engineer_agent.mc_setup(setup_args, env, init_model_stats)
+
+        i = 1
+        while self.state != STATE_DONE:
+
+            if self.state == STATE_WRITE:
+                # self.engineer_agent.model.reset_stats(init_model_stats)
+                if self.phase_parameters is not None:
+                    self.engineer_agent.receive_message('manager', self.phase_parameters)
+                t_dir = Path(str(traj_dir.absolute()) + f'iteration{i}')
+                t_dir.mkdir(exist_ok=True)
+                info, trajectory = self.engineer_agent.run_continue(env, observation, t_dir, return_type, 10)
+                save_predictions(t_dir, instance_id, info)
+                patch_path = save_patch(t_dir, instance_id, info)
+                if actions.apply_patch_locally and patch_path is not None and env.record["repo_type"] == "local":
+                    apply_patch(Path(env.repo_path), patch_file=patch_path)
+                self.state = STATE_MANAGE
+            elif self.state == STATE_MANAGE:
+                progress = self.engineer_agent.read_history().replace('manager', 'manager (you)')
+                out = self.manager_agent.invoke(
+                    f'I am the software engineer, here is my progress so far: {progress}'
+                )
+                try:
+                    for x in out.tool_calls:
+                        manager_tools_map[x['name']](tool_input=x['args'])
+                    if len(out.tool_calls) == 0:
+                        engineer(tool_input={'instructions': out.content})
+                except Exception as e:
+                    logger.error('Tool call failed.')
+                    logger.error(e)
+                    self.state = STATE_DONE
+
+            i += 1

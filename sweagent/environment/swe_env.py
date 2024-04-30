@@ -92,6 +92,7 @@ class SWEEnv(gym.Env):
         self.logger = logger
         self.persistent = args.container_name is not None
         self.returncode = None
+        self.repo_path = args.repo_path
         if not self.args.verbose:
             self.logger.disabled = True
 
@@ -132,7 +133,7 @@ class SWEEnv(gym.Env):
     def _repo_name(self) -> str:
         """Name of the local copy of the repository"""
         assert self.record is not None
-        return self.record["repo"].replace("/", "__")
+        return 'workspace_' + self.record["repo"].split("/")[-1]
     
     def _copy_repo(self) -> str:
         """Clone/copy repository/codebase in container
@@ -296,7 +297,7 @@ class SWEEnv(gym.Env):
             observation = "Skipped"
             info["exit_status"] = "skipped"
             return observation, 0, True, info
-        if action in {"exit_context", "exit_cost", "exit_error", "exit_format", "exit_api"}:
+        if action in {"exit_context", "exit_cost", "exit_error", "exit_format", "exit_api", "exit_steps"}:
             try:
                 observation = self.communicate(input="submit")
                 submission = self.get_submission('submit', observation)
@@ -317,7 +318,7 @@ class SWEEnv(gym.Env):
         # Attempt to run action in container
         observation = ""
         try:
-            observation = self.communicate(input=action, timeout_duration=25)
+            observation = self.communicate(input=action, timeout_duration=120)
         except TimeoutError:
             try:
                 self.interrupt()
@@ -452,7 +453,7 @@ class SWEEnv(gym.Env):
     def _communicate_experimental(
         self,
         input: str,
-        timeout_duration=25,
+        timeout_duration=120,
     ) -> str:
         """Experimental version of `_communicate`"""
 
@@ -478,7 +479,7 @@ class SWEEnv(gym.Env):
     def _communicate(
         self,
         input: str,
-        timeout_duration=25,
+        timeout_duration=120,
     ) -> str:
         if "SWE_AGENT_EXPERIMENTAL_COMMUNICATE" in os.environ:
             return self._communicate_experimental(input, timeout_duration)
@@ -518,7 +519,7 @@ class SWEEnv(gym.Env):
     def communicate(
         self,
         input: str,
-        timeout_duration=25,
+        timeout_duration=120,
     ) -> str:
         """
         Sends input to container and returns output
@@ -545,7 +546,7 @@ class SWEEnv(gym.Env):
             return ""
 
     def communicate_with_handling(
-        self, input: str, error_msg: str, timeout_duration=25
+        self, input: str, error_msg: str, timeout_duration=120
     ) -> str:
         """
         Wrapper for communicate function that raises error if return code is non-zero

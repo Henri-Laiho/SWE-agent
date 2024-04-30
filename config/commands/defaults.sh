@@ -192,4 +192,5 @@ submit() {
     echo "<<SUBMISSION||"
     cat model.patch
     echo "||SUBMISSION>>"
+    rm model.patch
 }
