@@ -293,8 +293,6 @@ def save_predictions(traj_dir: Path, instance_id: str, info):
     logger.info(f"Saved predictions to {output_file}")
 
 
-
-
 def save_patch(traj_dir: Path, instance_id: str, info) -> Optional[Path]:
     """Create patch files that can be applied with `git am`.
     
