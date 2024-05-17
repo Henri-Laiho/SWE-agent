@@ -21,7 +21,6 @@ from simple_parsing.helpers.serialization.serializable import FrozenSerializable
 from simple_parsing.helpers.flatten import FlattenedAccess
 from swebench import KEY_MODEL, KEY_INSTANCE_ID, KEY_PREDICTION
 
-from aiderrepomap.dump import dump
 from aiderrepomap.swe_repomap import RepoMap
 from sweagent.agent.commands import Command, ParseCommand
 from sweagent.agent.history_processors import HistoryProcessor
@@ -302,6 +301,44 @@ class Agent:
                         }
                     )
 
+    def forget_messages(self, search_keywords: list[str], delete_count: int):
+        kws = [x.lower() for x in search_keywords]
+        to_delete = [(i, self.history[i]) for i in range(len(self.history)) if any(kw in self.history[i]['content'].lower() for kw in kws)]
+        if abs(len(to_delete) - delete_count)/len(self.history) > 0.25:
+            logger.warning('Memory manager tried to delete %s but wanted to delete %s messages (keywords: %s)' % (len(to_delete), delete_count, search_keywords))
+            return
+
+        deleted = ""
+        for i, it in to_delete[::-1]:
+            if i < 3:
+                logger.warning('Memory manager trying to delete initial messages: %s; %s' % (delete_count, search_keywords))
+                continue
+            if i >= len(self.history) - 6:
+                logger.warning('Memory manager trying to delete too recent memories: %s; %s' % (delete_count, search_keywords))
+                continue
+            if it['role'] == 'user':
+                if self.history[i+1]['role'] == 'assistant':
+                    self.history.pop(i)
+                    self.history.pop(i-1)
+            elif it['role'] == 'assistant':
+                if self.history[i+1]['role'] == 'user':
+                    self.history.pop(i+1)
+                    self.history.pop(i)
+            else:
+                continue
+            deleted += f"{it['content'][:min(40, len(it['content']))]}...\n\n"
+
+        self.mc_trajectory.append(
+            {
+                "action": "N/A",
+                "observation": f"Memory manager deleted {len(to_delete)} messages: {deleted}",
+                "response": "N/A",
+                "state": "",
+                "thought": "N/A",
+            }
+        )
+
+
     @property
     def state_command(self) -> str:
         """Return the bash command that will be used to extract the environment state."""
@@ -471,6 +508,8 @@ class Agent:
     def read_history(self):
         history_content = ''
         for h in self.history:
+            if 'is_demo' in h:
+                continue
             role = h['role']
             if role == 'assistant':
                 role = self.name
@@ -494,6 +533,7 @@ class Agent:
             'Error:',
         ]
 
+        is_goto_action = action.startswith('goto')
         open_file = state_vars['open_file']
         failed = False
         last_goto_line = None
@@ -503,20 +543,21 @@ class Agent:
                     if any(self.history[-i]['content'].startswith(it) for it in error_feedbacks):
                         failed = True
                 elif 'assistant' == self.history[-i]['role']:
-                    if action == self.history[-i]['action']:
+                    if is_goto_action and self.history[-i]['action'].startswith('goto'):
+                        try:
+                            line = int(action.split()[-1])
+                            if last_goto_line is not None and abs(last_goto_line - line) < 60:
+                                return f"When scanning a file I should use the cat command to read the whole file at a time.", 'pwd && ls -la', output
+                        except ValueError:
+                            line = None
+                        last_goto_line = line
+                    elif action == self.history[-i]['action']:
                         if failed and (action != 'edit' or self.history[-i]['open_file'] == open_file):
                             act = action.split()[0]
                             solution = solutions[act] if act in solutions else ''
                             command_outcome = ' that previously failed' if failed else ''
                             return f"I am again trying to execute the command {act}{command_outcome}. I should try a different approach.{solution}", 'pwd && ls -la', output
-                        if action.startswith('goto'):
-                            try:
-                                line = int(action.split()[-1])
-                                if last_goto_line is not None and abs(last_goto_line - line) < 60:
-                                    return f"When scanning a file I should use the cat command to read the whole file at a time.", 'pwd && ls -la', output
-                            except ValueError:
-                                line = None
-                            last_goto_line = line
+                        last_goto_line = None
                     else:
                         last_goto_line = None
                     failed = False
@@ -1010,6 +1051,29 @@ def submit():
 
 
 @tool
+def forget_messages(search_keywords: list[str], delete_count: int):
+    """
+    Makes the engineer forget messages that contain a match to the `search_keyword` if there are exatly total
+    `delete_count` matches in chat history. The corresponding user or assistant message is also deleted for each match.
+
+    :param search_keywords: case-insensitive plain text search keyword
+    :param delete_count: number of message pairs expected to forget
+    """
+    SWESwarm.the_swarm.forget_messages(search_keywords, delete_count)
+
+@tool
+def forget_message(search_keyword: str, delete_count: int = 1):
+    """
+    Makes the engineer forget messages that contain a match to the `search_keyword` if there are exatly total
+    `delete_count` matches in chat history. The corresponding user or assistant message is also deleted for each match.
+
+    :param search_keyword: case-insensitive plain text search keyword
+    :param delete_count: number of message pairs expected to forget
+    """
+    SWESwarm.the_swarm.forget_messages([search_keyword], delete_count)
+
+
+@tool
 def noop():
     """No operation"""
     finish_tool(SWESwarm.the_swarm.state, SWESwarm.the_swarm.phase_parameters)
@@ -1033,9 +1097,14 @@ cfg = config.Config(os.path.join(os.getcwd(), "keys.cfg"))
 vertexai.init(project=cfg.VERTEX_PROJECT, location=cfg.VERTEX_LOCATION)
 
 llm = ChatVertexAI(model="gemini-1.5-pro-preview-0409")
+
 manager_tools = [engineer, manual_test, write_automatic_tests, submit]
 llm_mgr = llm.bind_tools(manager_tools)
 manager_tools_map = {x.name: x for x in manager_tools}
+
+memory_manager_tools = [forget_messages, forget_message]
+llm_mmgr = llm.bind_tools(manager_tools)
+memory_manager_tools_map = {x.name: x for x in memory_manager_tools}
 
 
 class LCAgent:
@@ -1061,6 +1130,14 @@ class LCAgent:
                 pass
             except RateLimitError:
                 pass
+            except ValueError as e:
+                if "Multiple content parts are not supported" in str(e):
+                    continue
+                raise e
+            except IndexError as e:
+                if "list index out of range" in str(e):
+                    continue
+                raise e
             except InternalServerError:
                 logger.warning('Internal server error occurred in LLM provider, waiting 15 seconds')
                 logger.debug(input)
@@ -1170,10 +1247,37 @@ class SWESwarm:
             the engineer, you provide instructions to make the engineer complete the task efficiently. It is important 
             to avoid the engineer getting stuck and wasting time as their working hours are costly. Remember, the 
             best way to ensure reliability of the software is by verifying automated test results and coverage and 
-            their match to product requirements (the ISSUE)."""
+            their match to product requirements (the ISSUE). Answer as if you are talking directly to the engineer"""
+        )
+        self.memory_manager_agent = LCAgent(
+            llm_mmgr,
+            """You are the memory manager agent of a software engineer working in a software development team. 
+            You are responsible for the quality of the engineer's mental space and ensuring that they can focus on the 
+            most important issues the they work on, without deleting important information from their memory. 
+            As a response, call the forget_message or forget_messages functions with search_keyword(s) to select 
+            message(s) to be deleted from the engineer's memory. In order to maximize the engineer's performance 
+            you should delete memories 
+            1) where the agent successfully solved local bugs like syntax errors, 
+            2) where the agent prepared the code execution environment like installing missing software, 
+            3) that introduce duplicate information - there is no need to repeat unless it is very important
+            4) where the agent is repeating similar actions, especially if with errors
+            5) messages from the manager agent that are old and have become irrelevant to the engineer's situation
+            6) other messages that are not important for the engineer to remember
+            
+            You should not delete messages that contain important information about the project, the issue like the 
+            first 4 messages and the last 6 messages (most recent memories)
+            
+            Use each keyword to select a unique sentence in the history. The delete count should usually equal to the 
+            number of keywords. For example if there is a message 
+            `The code seems to have the basic functionality for controlling the switch. However, there are some areas that need attention: ...`
+            use keyword `basic functionality for controlling the switch. However` to match this sentence and provide 
+            delete_count=1 to ensure the correct message is deleted."""
         )
         self.state = STATE_WRITE
         self.phase_parameters = None
+
+    def forget_messages(self, search_keywords: list[str], delete_count: int):
+        self.engineer_agent.forget_messages(search_keywords, delete_count)
 
     def run(
             self,
@@ -1193,34 +1297,49 @@ class SWESwarm:
 
         self.engineer_agent.mc_setup(setup_args, env, init_model_stats)
 
+        latest_patch_path = None
         i = 1
-        while self.state != STATE_DONE:
+        try:
+            while self.state != STATE_DONE:
 
-            if self.state == STATE_WRITE:
-                # self.engineer_agent.model.reset_stats(init_model_stats)
-                if self.phase_parameters is not None:
-                    self.engineer_agent.receive_message('manager', self.phase_parameters)
-                t_dir = Path(str(traj_dir.absolute()) + f'iteration{i}')
-                t_dir.mkdir(exist_ok=True)
-                info, trajectory = self.engineer_agent.run_continue(env, observation, t_dir, return_type, 10)
-                save_predictions(t_dir, instance_id, info)
-                patch_path = save_patch(t_dir, instance_id, info)
-                if actions.apply_patch_locally and patch_path is not None and env.record["repo_type"] == "local":
-                    apply_patch(Path(env.repo_path), patch_file=patch_path)
-                self.state = STATE_MANAGE
-            elif self.state == STATE_MANAGE:
-                progress = self.engineer_agent.read_history().replace('manager', 'manager (you)')
-                out = self.manager_agent.invoke(
-                    f'I am the software engineer, here is my progress so far: {progress}'
-                )
-                try:
-                    for x in out.tool_calls:
-                        manager_tools_map[x['name']](tool_input=x['args'])
-                    if len(out.tool_calls) == 0:
-                        engineer(tool_input={'instructions': out.content})
-                except Exception as e:
-                    logger.error('Tool call failed.')
-                    logger.error(e)
-                    self.state = STATE_DONE
+                if self.state == STATE_WRITE:
+                    # self.engineer_agent.model.reset_stats(init_model_stats)
+                    if self.phase_parameters is not None:
+                        self.engineer_agent.receive_message('manager', self.phase_parameters)
+                    t_dir = Path(str(traj_dir.absolute()) + f'iteration{i}')
+                    t_dir.mkdir(exist_ok=True)
+                    info, trajectory = self.engineer_agent.run_continue(env, observation, t_dir, return_type, 10)
+                    save_predictions(t_dir, instance_id, info)
+                    latest_patch_path = save_patch(t_dir, instance_id, info)
+                    self.state = STATE_MANAGE
+                elif self.state == STATE_MANAGE:
+                    progress = self.engineer_agent.read_history()
+                    if len(self.engineer_agent.history) > 10:
+                        out = self.memory_manager_agent.invoke(
+                            f'I am the software engineer, here is my message history memory: {progress}'
+                        )
+                        try:
+                            for x in out.tool_calls:
+                                memory_manager_tools_map[x['name']](tool_input=x['args'])
+                        except Exception as e:
+                            logger.error('Tool call failed.')
+                            logger.error(e)
 
-            i += 1
+                    progress_mgr = progress.replace('manager', 'manager (you)')
+                    out = self.manager_agent.invoke(
+                        f'I am the software engineer, here is my progress so far: {progress_mgr}'
+                    )
+                    try:
+                        for x in out.tool_calls:
+                            manager_tools_map[x['name']](tool_input=x['args'])
+                        if len(out.tool_calls) == 0:
+                            engineer(tool_input={'instructions': out.content})
+                    except Exception as e:
+                        logger.error('Tool call failed.')
+                        logger.error(e)
+                        self.state = STATE_DONE
+
+                i += 1
+        finally:
+            if actions.apply_patch_locally and latest_patch_path is not None and env.record["repo_type"] == "local":
+                apply_patch(Path(env.repo_path), patch_file=latest_patch_path)
